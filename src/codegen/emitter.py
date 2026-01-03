@@ -525,10 +525,10 @@ class Emitter:
         label2 = frame.get_new_label()
         result = list()
         result.append(self.emit_if_true(label1, frame))
-        result.append(self.emit_push_const("true", in_, frame))
+        result.append(self.emit_push_const("1", PrimitiveType("int"), frame)) # Push true (1)
         result.append(self.emit_goto(label2, frame))
         result.append(self.emit_label(label1, frame))
-        result.append(self.emit_push_const("false", in_, frame))
+        result.append(self.emit_push_const("0", PrimitiveType("int"), frame)) # Push false (0)
         result.append(self.emit_label(label2, frame))
         return "".join(result)
 
