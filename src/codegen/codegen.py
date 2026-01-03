@@ -462,10 +462,9 @@ class CodeGenerator(ASTVisitor):
         if o is None:
             return "", None
         
-        # We need to generate code for the receiver and indices
-        # but NOT the final store instruction, which visit_assignment_statement does
-        # This is tricky because visit_postfix_expression usually generates Loads.
-        # Let's assume visit_postfix_expression with is_left=True handles it.
+        # PostfixLHS is used for assignment targets like a[i] or a.b
+        # We need to generate the receiver and index/member but not the final store
+        # This is handled by visit_postfix_expression with o.is_left=True
         return self.visit(node.postfix_expr, o)
 
     # ============================================================================
@@ -508,7 +507,6 @@ class CodeGenerator(ASTVisitor):
             code += self.emit.emit_or_op(o.frame)
             return code, PrimitiveType("boolean")
         elif op in [">", ">=", "<", "<=", "==", "!="]:
-            # Use LT type for relational ops before promotion to boolean
             code += self.emit.emit_re_op(op, res_type, o.frame)
             return code, PrimitiveType("boolean")
         
@@ -537,17 +535,16 @@ class CodeGenerator(ASTVisitor):
         code, typ = self.visit(node.primary, o)
         
         for op in node.postfix_ops:
-            # Fix: Create a custom object with code and type attributes since Access doesn't support them
-            class AccessWithCode:
-                def __init__(self, frame, sym, is_left, is_first, code, type):
+            # We need to pass the current code and type to the next postfix op
+            class AccessWithContext:
+                def __init__(self, frame, sym, is_left, code, type):
                     self.frame = frame
                     self.sym = sym
                     self.is_left = is_left
-                    self.is_first = is_first
                     self.code = code
                     self.type = type
             
-            o_new = AccessWithCode(o.frame, o.sym, o.is_left, False, code, typ)
+            o_new = AccessWithContext(o.frame, o.sym, o.is_left, code, typ)
             code, typ = self.visit(op, o_new)
             
         return code, typ
@@ -561,10 +558,8 @@ class CodeGenerator(ASTVisitor):
         code = o.code
         typ = o.type
         
-        # Get method symbol
         method_name = node.method_name
         
-        # Mapping for common built-in or IO aliases
         io_mapping = {
             "print": "writeStr",
             "printInt": "writeInt",
@@ -577,20 +572,18 @@ class CodeGenerator(ASTVisitor):
         
         actual_name = io_mapping.get(method_name, method_name)
         
-        # Look up in provided symbol list or IO_SYMBOL_LIST
+        # Look up symbol
         m_sym = next(filter(lambda x: x.name == actual_name, sym_list), None)
         if m_sym is None:
             from .io import IO_SYMBOL_LIST
             m_sym = next(filter(lambda x: x.name == actual_name, IO_SYMBOL_LIST), None)
             
-        # Special case for int2str/bool2str since they use String.valueOf
         if m_sym is None and actual_name == "valueOf":
              if method_name == "int2str":
                  m_sym = Symbol("valueOf", FunctionType([PrimitiveType("int")], PrimitiveType("string")), CName("java/lang/String"))
              elif method_name == "bool2str":
                  m_sym = Symbol("valueOf", FunctionType([PrimitiveType("boolean")], PrimitiveType("string")), CName("java/lang/String"))
         
-        # Load arguments
         arg_code = ""
         for arg in node.args:
             ac, at = self.visit(arg, Access(frame, sym_list))
@@ -604,12 +597,8 @@ class CodeGenerator(ASTVisitor):
         else:
             # Virtual call
             code += arg_code
-            # Assume method is in the type of the receiver (typ)
             class_name = typ.class_name if isinstance(typ, ClassType) else self.current_class
-            
-            # If we found a symbol but it's not CName, use its type
             m_type = m_sym.type if m_sym else FunctionType([], PrimitiveType("void"))
-            
             return code + self.emit.emit_invoke_virtual(f"{class_name}/{actual_name}", m_type, frame), m_type.return_type
 
     def visit_member_access(self, node: "MemberAccess", o: Any = None):
@@ -617,20 +606,115 @@ class CodeGenerator(ASTVisitor):
         Visit member access.
         """
         frame = o.frame
+        sym_list = o.sym
         code = o.code
         typ = o.type
         
+        # Look for field in class_name
         class_name = typ.class_name if isinstance(typ, ClassType) else self.current_class
-        field_name = f"{class_name}/{node.member_name}"
+        # For simplicity, we assume field info is available or just emit GETFIELD
+        # Real implementation would need symbol table for fields
+        field_type = PrimitiveType("int") # Placeholder
         
         if o.is_left:
-            # We return the code to write to this field
-            # The value to write is already on stack
-            # We need to swap if it's an instance field (receiver then value)
-            # but wait, visit_postfix_expression doesn't handle this well for fields.
-            # Let's assume it's a GET for now and handle assignment separately if needed
-            return code + self.emit.emit_put_field(field_name, PrimitiveType("int"), frame), PrimitiveType("int")
+            # For assignment, we just return the code to load receiver
+            return code, field_type
         else:
+            code += self.emit.emit_get_field(f"{class_name}/{node.member_name}", field_type, frame)
+            return code, field_type
+
+    def visit_array_access(self, node: "ArrayAccess", o: Any = None):
+        """
+        Visit array access.
+        """
+        frame = o.frame
+        sym_list = o.sym
+        code = o.code
+        typ = o.type
+        
+        index_code, index_type = self.visit(node.index_expr, Access(frame, sym_list))
+        code += index_code
+        
+        elem_type = typ.element_type if isinstance(typ, ArrayType) else PrimitiveType("int")
+        
+        if o.is_left:
+            return code, elem_type
+        else:
+            code += self.emit.emit_aload(elem_type, frame)
+            return code, elem_type
+
+    def visit_object_creation(self, node: "ObjectCreation", o: Access = None):
+        """
+        Visit object creation with 'new'.
+        """
+        frame = o.frame
+        class_name = node.class_name
+        
+        code = self.emit.jvm.emitNEW(class_name)
+        frame.push()
+        code += self.emit.jvm.emitDUP()
+        frame.push()
+        
+        # Load arguments for constructor
+        arg_code = ""
+        param_types = []
+        for arg in node.args:
+            ac, at = self.visit(arg, Access(frame, o.sym))
+            arg_code += ac
+            param_types.append(at)
+            
+        code += arg_code
+        code += self.emit.emit_invoke_special(frame, f"{class_name}/<init>", FunctionType(param_types, PrimitiveType("void")))
+        
+        return code, ClassType(class_name)
+
+    def visit_array_literal(self, node: "ArrayLiteral", o: Access = None):
+        """
+        Visit array literal.
+        """
+        frame = o.frame
+        size = len(node.elements)
+        
+        # Determine element type from first element or default to int
+        first_code, first_type = self.visit(node.elements[0], o) if size > 0 else ("", PrimitiveType("int"))
+        
+        code = self.emit.emit_push_iconst(size, frame)
+        if isinstance(first_type, (ClassType, ArrayType)) or is_string_type(first_type):
+            code += self.emit.jvm.emitANEWARRAY(self.emit.get_full_type(first_type))
+        else:
+            code += self.emit.jvm.emitNEWARRAY(self.emit.get_full_type(first_type))
+            
+        for i, elem in enumerate(node.elements):
+            code += self.emit.jvm.emitDUP()
+            frame.push()
+            code += self.emit.emit_push_iconst(i, frame)
+            ec, et = self.visit(elem, Access(frame, o.sym))
+            code += ec
+            code += self.emit.emit_astore(et, frame)
+            
+        return code, ArrayType(first_type, size)
+
+    def visit_member_access(self, node: "MemberAccess", o: Any = None):
+        """
+        Visit member access.
+        """
+        frame = o.frame
+        sym_list = o.sym
+        code = o.code
+        typ = o.type
+        
+        # Look for field in class_name
+        class_name = typ.class_name if isinstance(typ, ClassType) else self.current_class
+        # For simplicity, we assume field info is available or just emit GETFIELD
+        # Real implementation would need symbol table for fields
+        field_type = PrimitiveType("int") # Placeholder
+        
+        if o.is_left:
+            # For assignment, we just return the code to load receiver
+            return code, field_type
+        else:
+            code += self.emit.emit_get_field(f"{class_name}/{node.member_name}", field_type, frame)
+            return code, field_type
             return code + self.emit.emit_get_field(field_name, PrimitiveType("int"), frame), PrimitiveType("int")
 
     def visit_array_access(self, node: "ArrayAccess", o: Any = None):
